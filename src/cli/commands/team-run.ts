@@ -8,8 +8,11 @@ import {
   MIN_WORKERS,
   isLegacyRunningSuccessEnabled,
 } from '../../team/constants.js';
-import { validateShellSafe, validateTaskId, validateWorkerCount } from '../../utils/security.js';
+import { loadPluginRegistry, type PluginRegistry } from '../../plugins/registry.js';
+import type { OmgPluginLoadResult } from '../../plugins/types.js';
+import { validateTaskId, validateWorkerCount } from '../../utils/security.js';
 import { normalizeSubagentId } from '../../team/subagents-catalog.js';
+import type { TeamRunResult } from '../../team/types.js';
 import type { CliIo, CommandExecutionResult } from '../types.js';
 import {
   getTeamStateDir,
@@ -73,12 +76,12 @@ const SUBAGENT_KEYWORD_TOKEN_PATTERN = /^([/$])([a-zA-Z0-9][a-zA-Z0-9._-]*)$/;
 
 function printTeamRunHelp(io: CliIo): void {
   io.stdout([
-    'Usage: omg team run --task "<description>" [--team <name>] [--backend tmux|subagents] [--workers <1..8>] [--subagents <ids>] [--max-fix-loop <n>] [--dry-run] [--json]',
+    'Usage: omg team run --task "<description>" [--team <name>] [--backend <name>] [--workers <1..8>] [--subagents <ids>] [--max-fix-loop <n>] [--dry-run] [--json]',
     '',
     'Options:',
     '  --task <text>        Required task description for orchestration',
     '  --team <name>        Team state namespace (default: oh-my-gemini)',
-    '  --backend <name>     Runtime backend (default: tmux, auto-selected by leading backend tags when omitted)',
+    '  --backend <name>     Runtime backend (default: tmux, plugin backend ids supported)',
     `  --workers <n>        Worker count (${MIN_WORKERS}..${MAX_WORKERS}, default: ${DEFAULT_WORKERS}; subagents with explicit assignments must match count)`,
     '  --subagents <ids>    Comma-separated subagent ids (subagents backend only)',
     `  --max-fix-loop <n>   Max fix attempts before fail (0..${DEFAULT_FIX_LOOP_CAP}, default: ${DEFAULT_FIX_LOOP_CAP})`,
@@ -291,21 +294,56 @@ function resolveWorkerCountForBackend(params: {
     return resolved;
   }
 
-  const assignmentCount = resolvedSubagents?.length;
-  if (assignmentCount && assignmentCount > 0) {
-    if (explicitWorkers !== undefined && explicitWorkers !== assignmentCount) {
-      throw new Error(
-        `Subagents worker mismatch: --workers=${explicitWorkers} but ${assignmentCount} subagent assignment(s) were resolved.`,
-      );
+  if (backend === 'subagents') {
+    const assignmentCount = resolvedSubagents?.length;
+    if (assignmentCount && assignmentCount > 0) {
+      if (explicitWorkers !== undefined && explicitWorkers !== assignmentCount) {
+        throw new Error(
+          `Subagents worker mismatch: --workers=${explicitWorkers} but ${assignmentCount} subagent assignment(s) were resolved.`,
+        );
+      }
+
+      assertWorkerCountWithinRange(assignmentCount);
+      return assignmentCount;
     }
 
-    assertWorkerCountWithinRange(assignmentCount);
-    return assignmentCount;
+    const resolved = explicitWorkers ?? DEFAULT_WORKERS;
+    assertWorkerCountWithinRange(resolved);
+    return resolved;
   }
 
-  const resolved = explicitWorkers ?? DEFAULT_WORKERS;
-  assertWorkerCountWithinRange(resolved);
-  return resolved;
+  if (explicitWorkers !== undefined) {
+    assertWorkerCountWithinRange(explicitWorkers);
+    return explicitWorkers;
+  }
+
+  return DEFAULT_WORKERS;
+}
+
+function buildPluginDiagnostics(load: OmgPluginLoadResult | undefined): Record<string, unknown> | undefined {
+  if (!load) {
+    return undefined;
+  }
+
+  return {
+    enabled: load.enabled,
+    discovered: load.candidates.length,
+    loaded: load.plugins.map((plugin) => plugin.id),
+    failures: load.failures,
+  };
+}
+
+async function unloadPluginHooks(registry: PluginRegistry | undefined): Promise<string | undefined> {
+  if (!registry) {
+    return undefined;
+  }
+
+  try {
+    await registry.invokeUnloadHooks();
+    return undefined;
+  } catch (error) {
+    return (error as Error).message;
+  }
 }
 
 export async function runTeamCommand(input: TeamRunInput): Promise<TeamRunOutput> {
@@ -397,29 +435,67 @@ export async function runTeamCommand(input: TeamRunInput): Promise<TeamRunOutput
     };
   }
 
-  const { TeamOrchestrator } = await import('../../team/team-orchestrator.js');
-  const orchestrator = new TeamOrchestrator();
+  let pluginRegistry: PluginRegistry | undefined;
+  let pluginLoad: OmgPluginLoadResult | undefined;
+  try {
+    const loaded = await loadPluginRegistry({
+      cwd: input.cwd,
+      env: process.env,
+    });
+    pluginRegistry = loaded.registry;
+    pluginLoad = loaded.load;
+  } catch (error) {
+    return {
+      exitCode: 1,
+      message: `Failed to initialize plugin runtime registry: ${(error as Error).message}`,
+      details: {
+        teamName,
+        backend: input.backend,
+        workers: input.workers,
+        task: input.task,
+        subagents: input.subagents,
+        maxFixLoop: input.maxFixLoop,
+        watchdogMs: input.watchdogMs,
+        nonReportingMs: input.nonReportingMs,
+        runRequestPath,
+        resumeInputPath,
+        taskAuditLogPath,
+      },
+    };
+  }
 
-  const runResult = await orchestrator.run({
-    teamName,
-    task: input.task,
-    cwd: input.cwd,
-    backend: input.backend,
-    workers: input.workers,
-    subagents: input.subagents,
-    maxFixAttempts: input.maxFixLoop,
-    watchdogMs: input.watchdogMs,
-    nonReportingMs: input.nonReportingMs,
-    metadata: {
-      invokedBy: 'omg team run',
-    },
+  const { TeamOrchestrator } = await import('../../team/team-orchestrator.js');
+  const orchestrator = new TeamOrchestrator({
+    backends: pluginRegistry.createRuntimeBackendRegistry(),
   });
 
-  if (runResult.handle) {
-    await orchestrator.shutdown(runResult.handle, true).catch(() => undefined);
+  let runResult: TeamRunResult;
+  let pluginUnloadWarning: string | undefined;
+  try {
+    runResult = await orchestrator.run({
+      teamName,
+      task: input.task,
+      cwd: input.cwd,
+      backend: input.backend,
+      workers: input.workers,
+      subagents: input.subagents,
+      maxFixAttempts: input.maxFixLoop,
+      watchdogMs: input.watchdogMs,
+      nonReportingMs: input.nonReportingMs,
+      metadata: {
+        invokedBy: 'omg team run',
+      },
+    });
+
+    if (runResult.handle) {
+      await orchestrator.shutdown(runResult.handle, true).catch(() => undefined);
+    }
+  } finally {
+    pluginUnloadWarning = await unloadPluginHooks(pluginRegistry);
   }
 
   const phaseFilePath = path.join(teamStateDir, 'phase.json');
+  const pluginDiagnostics = buildPluginDiagnostics(pluginLoad);
 
   if (runResult.success) {
     return {
@@ -438,6 +514,8 @@ export async function runTeamCommand(input: TeamRunInput): Promise<TeamRunOutput
         runRequestPath,
         resumeInputPath,
         taskAuditLogPath,
+        ...(pluginDiagnostics ? { plugins: pluginDiagnostics } : {}),
+        ...(pluginUnloadWarning ? { pluginUnloadWarning } : {}),
       },
     };
   }
@@ -462,6 +540,8 @@ export async function runTeamCommand(input: TeamRunInput): Promise<TeamRunOutput
       runRequestPath,
       resumeInputPath,
       taskAuditLogPath,
+      ...(pluginDiagnostics ? { plugins: pluginDiagnostics } : {}),
+      ...(pluginUnloadWarning ? { pluginUnloadWarning } : {}),
     },
   };
 }
@@ -526,7 +606,6 @@ export async function executeTeamRunCommand(
     return { exitCode: CLI_USAGE_EXIT_CODE };
   }
 
-  // Security: Validate task input for shell safety after stripping keyword tags.
   try {
     validateTaskId(task);
   } catch (error) {
@@ -538,7 +617,7 @@ export async function executeTeamRunCommand(
   const subagentsOptionProvided =
     getStringOption(parsed.options, ['subagents']) !== undefined;
   if (backendOptionRaw !== undefined && !isTeamBackend(backendOptionRaw)) {
-    io.stderr(`Invalid --backend value: ${backendOptionRaw}. Expected: tmux | subagents`);
+    io.stderr(`Invalid --backend value: ${backendOptionRaw}. Expected backend identifier pattern [a-z0-9][a-z0-9._-]*`);
     return { exitCode: CLI_USAGE_EXIT_CODE };
   }
 
@@ -562,7 +641,7 @@ export async function executeTeamRunCommand(
   }
 
   if (!isTeamBackend(backendRaw)) {
-    io.stderr(`Invalid --backend value: ${backendRaw}. Expected: tmux | subagents`);
+    io.stderr(`Invalid --backend value: ${backendRaw}. Expected backend identifier pattern [a-z0-9][a-z0-9._-]*`);
     return { exitCode: CLI_USAGE_EXIT_CODE };
   }
 
@@ -626,7 +705,6 @@ export async function executeTeamRunCommand(
     return { exitCode: CLI_USAGE_EXIT_CODE };
   }
 
-  // Security: Validate worker count bounds
   try {
     validateWorkerCount(workers);
   } catch (error) {

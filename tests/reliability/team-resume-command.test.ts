@@ -150,6 +150,35 @@ describe('reliability: team resume command', () => {
   });
 
 
+
+  test('accepts plugin backend override and forwards it to injected runner', async () => {
+    const ioCapture = createIoCapture();
+    const observed: {
+      backend?: string;
+    } = {};
+
+    const result = await executeTeamResumeCommand(
+      [
+        '--backend',
+        'custom-plugin-runtime',
+      ],
+      {
+        cwd: process.cwd(),
+        io: ioCapture.io,
+        resumeRunner: async (input: TeamResumeInput) => {
+          observed.backend = input.backend;
+          return {
+            exitCode: 0,
+            message: 'ok',
+          };
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(observed.backend).toBe('custom-plugin-runtime');
+  });
+
   test('parses options and forwards normalized input to injected runner', async () => {
     const ioCapture = createIoCapture();
     const observed: {

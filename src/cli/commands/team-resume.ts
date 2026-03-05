@@ -8,7 +8,9 @@ import {
 } from '../../team/constants.js';
 import { normalizeSubagentId } from '../../team/subagents-catalog.js';
 import { TeamOrchestrator } from '../../team/team-orchestrator.js';
-import type { RuntimeBackendName } from '../../team/runtime/runtime-backend.js';
+import { loadPluginRegistry, type PluginRegistry } from '../../plugins/registry.js';
+import type { OmgPluginLoadResult } from '../../plugins/types.js';
+import type { TeamRunResult } from '../../team/types.js';
 import type { CliIo, CommandExecutionResult } from '../types.js';
 
 import {
@@ -74,7 +76,7 @@ function printTeamResumeHelp(io: CliIo): void {
     '  --watchdog-ms <n>     Override watchdog threshold in milliseconds',
     '  --non-reporting-ms <n>  Override heartbeat staleness threshold in milliseconds',
     '  --task <text>         Override task text when persisted run metadata is missing',
-    '  --backend <name>      Override backend (tmux|subagents)',
+    '  --backend <name>      Override backend (tmux|subagents|<plugin-backend>)',
     '  --workers <n>         Override worker count (1..8)',
     '  --subagents <ids>     Override comma-separated subagent assignments',
     '  --dry-run             Validate resolved resume input without executing runtime',
@@ -246,7 +248,7 @@ function resolveBackend(
     return persistedBackend;
   }
 
-  return snapshotBackend === 'subagents' ? 'subagents' : 'tmux';
+  return isTeamBackend(snapshotBackend) ? snapshotBackend : 'tmux';
 }
 
 function resolveWorkers(params: {
@@ -296,6 +298,32 @@ function buildRunMetadata(input: TeamResumeInput): Record<string, unknown> {
       nonReportingMs: input.nonReportingMs !== undefined,
     },
   };
+}
+
+function buildPluginDiagnostics(load: OmgPluginLoadResult | undefined): Record<string, unknown> | undefined {
+  if (!load) {
+    return undefined;
+  }
+
+  return {
+    enabled: load.enabled,
+    discovered: load.candidates.length,
+    loaded: load.plugins.map((plugin) => plugin.id),
+    failures: load.failures,
+  };
+}
+
+async function unloadPluginHooks(registry: PluginRegistry | undefined): Promise<string | undefined> {
+  if (!registry) {
+    return undefined;
+  }
+
+  try {
+    await registry.invokeUnloadHooks();
+    return undefined;
+  } catch (error) {
+    return (error as Error).message;
+  }
 }
 
 async function defaultResumeRunner(input: TeamResumeInput): Promise<TeamResumeOutput> {
@@ -438,23 +466,60 @@ async function defaultResumeRunner(input: TeamResumeInput): Promise<TeamResumeOu
     };
   }
 
-  const orchestrator = new TeamOrchestrator({ stateStore });
-  const runResult = await orchestrator.run({
-    teamName,
-    task,
-    cwd: executionDefaults.cwd ?? input.cwd,
-    backend: backend as RuntimeBackendName,
-    workers,
-    subagents,
-    maxFixAttempts: maxFixLoop,
-    watchdogMs,
-    nonReportingMs,
-    metadata: buildRunMetadata(input),
-  });
-
-  if (runResult.handle) {
-    await orchestrator.shutdown(runResult.handle, true).catch(() => undefined);
+  let pluginRegistry: PluginRegistry | undefined;
+  let pluginLoad: OmgPluginLoadResult | undefined;
+  try {
+    const loaded = await loadPluginRegistry({
+      cwd: input.cwd,
+      env: process.env,
+    });
+    pluginRegistry = loaded.registry;
+    pluginLoad = loaded.load;
+  } catch (error) {
+    return {
+      exitCode: 1,
+      message: `Failed to initialize plugin runtime registry: ${(error as Error).message}`,
+      details: {
+        teamName,
+        backend,
+        workers,
+        subagents,
+        task,
+        maxFixLoop,
+        watchdogMs,
+        nonReportingMs,
+      },
+    };
   }
+
+  const orchestrator = new TeamOrchestrator({
+    stateStore,
+    backends: pluginRegistry.createRuntimeBackendRegistry(),
+  });
+  let runResult: TeamRunResult;
+  let pluginUnloadWarning: string | undefined;
+  try {
+    runResult = await orchestrator.run({
+      teamName,
+      task,
+      cwd: executionDefaults.cwd ?? input.cwd,
+      backend,
+      workers,
+      subagents,
+      maxFixAttempts: maxFixLoop,
+      watchdogMs,
+      nonReportingMs,
+      metadata: buildRunMetadata(input),
+    });
+
+    if (runResult.handle) {
+      await orchestrator.shutdown(runResult.handle, true).catch(() => undefined);
+    }
+  } finally {
+    pluginUnloadWarning = await unloadPluginHooks(pluginRegistry);
+  }
+
+  const pluginDiagnostics = buildPluginDiagnostics(pluginLoad);
 
   if (runResult.success) {
     return {
@@ -471,6 +536,8 @@ async function defaultResumeRunner(input: TeamResumeInput): Promise<TeamResumeOu
         maxFixLoop,
         watchdogMs,
         nonReportingMs,
+        ...(pluginDiagnostics ? { plugins: pluginDiagnostics } : {}),
+        ...(pluginUnloadWarning ? { pluginUnloadWarning } : {}),
       },
     };
   }
@@ -492,6 +559,8 @@ async function defaultResumeRunner(input: TeamResumeInput): Promise<TeamResumeOu
       watchdogMs,
       nonReportingMs,
       issues: runResult.issues,
+      ...(pluginDiagnostics ? { plugins: pluginDiagnostics } : {}),
+      ...(pluginUnloadWarning ? { pluginUnloadWarning } : {}),
     },
   };
 }
@@ -536,7 +605,7 @@ export async function executeTeamResumeCommand(
   let backend: TeamBackend | undefined;
   if (backendRaw !== undefined) {
     if (!isTeamBackend(backendRaw)) {
-      io.stderr(`Invalid --backend value: ${backendRaw}. Expected: tmux | subagents`);
+      io.stderr(`Invalid --backend value: ${backendRaw}. Expected backend identifier pattern [a-z0-9][a-z0-9._-]*`);
       return { exitCode: CLI_USAGE_EXIT_CODE };
     }
 

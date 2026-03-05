@@ -1,16 +1,18 @@
 import path from 'node:path';
 
 import { normalizeTeamNameCanonical } from '../../common/team-name.js';
+import type { RuntimeBackendName } from '../../team/runtime/runtime-backend.js';
 import {
   ensureDirectory,
   readJsonFile,
   writeJsonFile,
 } from '../../state/index.js';
 
-export type TeamBackend = 'tmux' | 'subagents';
+export type TeamBackend = RuntimeBackendName;
 
 const TEAM_RUN_REQUEST_SCHEMA_VERSION = 1;
 const TEAM_DEFAULT_NAME = 'oh-my-gemini';
+const TEAM_BACKEND_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 
 export interface PersistedTeamRunRequest {
   schemaVersion: number;
@@ -52,7 +54,7 @@ export function normalizeTeamName(raw: string | undefined): string {
 }
 
 export function isTeamBackend(value: string | undefined): value is TeamBackend {
-  return value === 'tmux' || value === 'subagents';
+  return typeof value === 'string' && TEAM_BACKEND_NAME_PATTERN.test(value);
 }
 
 export function getTeamStateDir(cwd: string, teamName: string): string {

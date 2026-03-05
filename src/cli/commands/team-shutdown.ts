@@ -6,6 +6,8 @@ import { CLI_USAGE_EXIT_CODE } from '../../team/constants.js';
 import { TeamOrchestrator } from '../../team/team-orchestrator.js';
 import type { TeamHandle } from '../../team/types.js';
 import type { RuntimeBackendName } from '../../team/runtime/runtime-backend.js';
+import { loadPluginRegistry, type PluginRegistry } from '../../plugins/registry.js';
+import type { OmgPluginLoadResult } from '../../plugins/types.js';
 import type { CliIo, CommandExecutionResult } from '../types.js';
 
 import {
@@ -14,7 +16,7 @@ import {
   hasFlag,
   parseCliArgs,
 } from './arg-utils.js';
-import { normalizeTeamName } from './team-command-shared.js';
+import { isTeamBackend, normalizeTeamName } from './team-command-shared.js';
 
 export interface TeamShutdownInput {
   teamName: string;
@@ -55,10 +57,36 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function resolveBackendName(raw: string | undefined): RuntimeBackendName {
-  if (raw === 'tmux' || raw === 'subagents') {
+  if (isTeamBackend(raw)) {
     return raw;
   }
   return 'tmux';
+}
+
+function buildPluginDiagnostics(load: OmgPluginLoadResult | undefined): Record<string, unknown> | undefined {
+  if (!load) {
+    return undefined;
+  }
+
+  return {
+    enabled: load.enabled,
+    discovered: load.candidates.length,
+    loaded: load.plugins.map((plugin) => plugin.id),
+    failures: load.failures,
+  };
+}
+
+async function unloadPluginHooks(registry: PluginRegistry | undefined): Promise<string | undefined> {
+  if (!registry) {
+    return undefined;
+  }
+
+  try {
+    await registry.invokeUnloadHooks();
+    return undefined;
+  } catch (error) {
+    return (error as Error).message;
+  }
 }
 
 function resolveHandleCwd(runtime: Record<string, unknown>, fallbackCwd: string): string {
@@ -169,14 +197,19 @@ async function defaultShutdownRunner(
     runtime,
   };
 
-  const orchestrator = new TeamOrchestrator({ stateStore });
-
+  let pluginRegistry: PluginRegistry | undefined;
+  let pluginLoad: OmgPluginLoadResult | undefined;
   try {
-    await orchestrator.shutdown(handle, input.force);
+    const loaded = await loadPluginRegistry({
+      cwd: input.cwd,
+      env: process.env,
+    });
+    pluginRegistry = loaded.registry;
+    pluginLoad = loaded.load;
   } catch (error) {
     return {
       exitCode: 1,
-      message: `Team shutdown failed: ${(error as Error).message}`,
+      message: `Failed to initialize plugin runtime registry: ${(error as Error).message}`,
       details: {
         teamName,
         backend: handle.backend,
@@ -184,6 +217,32 @@ async function defaultShutdownRunner(
       },
     };
   }
+
+  const pluginDiagnostics = buildPluginDiagnostics(pluginLoad);
+  const orchestrator = new TeamOrchestrator({
+    stateStore,
+    backends: pluginRegistry.createRuntimeBackendRegistry(),
+  });
+
+  let pluginUnloadWarning: string | undefined;
+  try {
+    await orchestrator.shutdown(handle, input.force);
+  } catch (error) {
+    pluginUnloadWarning = await unloadPluginHooks(pluginRegistry);
+    return {
+      exitCode: 1,
+      message: `Team shutdown failed: ${(error as Error).message}`,
+      details: {
+        teamName,
+        backend: handle.backend,
+        force: input.force,
+        ...(pluginDiagnostics ? { plugins: pluginDiagnostics } : {}),
+        ...(pluginUnloadWarning ? { pluginUnloadWarning } : {}),
+      },
+    };
+  }
+
+  pluginUnloadWarning = await unloadPluginHooks(pluginRegistry);
 
   const now = new Date().toISOString();
   let stateWriteWarning: string | undefined;
@@ -227,6 +286,8 @@ async function defaultShutdownRunner(
       backend: handle.backend,
       force: input.force,
       stateRoot: stateStore.rootDir,
+      ...(pluginDiagnostics ? { plugins: pluginDiagnostics } : {}),
+      ...(pluginUnloadWarning ? { pluginUnloadWarning } : {}),
       ...(stateWriteWarning ? { stateWriteWarning } : {}),
     },
   };

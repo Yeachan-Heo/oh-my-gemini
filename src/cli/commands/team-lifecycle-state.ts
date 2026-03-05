@@ -5,9 +5,10 @@ import {
   readJsonFile,
   writeJsonFile,
 } from '../../state/filesystem.js';
+import type { RuntimeBackendName } from '../../team/runtime/runtime-backend.js';
 import { normalizeTeamName } from './team-command-shared.js';
 
-export type TeamLifecycleBackend = 'tmux' | 'subagents';
+export type TeamLifecycleBackend = RuntimeBackendName;
 
 export interface TeamResumeInputState {
   schemaVersion: 1;
@@ -76,8 +77,10 @@ function normalizeNonNegativeInteger(
   return value;
 }
 
+const BACKEND_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
+
 function normalizeBackend(raw: unknown): TeamLifecycleBackend {
-  if (raw === 'tmux' || raw === 'subagents') {
+  if (typeof raw === 'string' && BACKEND_NAME_PATTERN.test(raw)) {
     return raw;
   }
 

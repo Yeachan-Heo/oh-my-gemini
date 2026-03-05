@@ -516,6 +516,42 @@ describe('reliability: team run subagent assignment parsing', () => {
     expect(ioCapture.stderr.join('\n')).toMatch(/--bogus-option/i);
   });
 
+
+  test('accepts plugin backend names when provided via --backend', async () => {
+    const ioCapture = createIoCapture();
+    const observed: {
+      input?: { backend: string; workers: number };
+    } = {};
+
+    const result = await executeTeamRunCommand(
+      [
+        '--task',
+        'ship custom plugin backend',
+        '--backend',
+        'custom-plugin-runtime',
+      ],
+      {
+        cwd: process.cwd(),
+        io: ioCapture.io,
+        teamRunner: async (input) => {
+          observed.input = {
+            backend: input.backend,
+            workers: input.workers,
+          };
+          return {
+            exitCode: 0,
+            message: 'ok',
+          };
+        },
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(observed.input?.backend).toBe('custom-plugin-runtime');
+    expect(observed.input?.workers).toBe(DEFAULT_WORKERS);
+    expect(ioCapture.stderr).toStrictEqual([]);
+  });
+
   test('rejects unsafe team identifiers that can escape team namespace', async () => {
     const ioCapture = createIoCapture();
 

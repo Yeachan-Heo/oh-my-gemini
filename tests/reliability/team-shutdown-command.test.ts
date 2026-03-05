@@ -1,9 +1,12 @@
+import path from 'node:path';
+import { mkdir, writeFile } from 'node:fs/promises';
+
 import { describe, expect, test } from 'vitest';
 
 import { executeTeamShutdownCommand } from '../../src/cli/commands/team-shutdown.js';
+import type { TeamShutdownInput } from '../../src/cli/commands/team-shutdown.js';
 import { TeamStateStore } from '../../src/state/index.js';
 import type { CliIo } from '../../src/cli/types.js';
-import type { TeamShutdownInput } from '../../src/cli/commands/team-shutdown.js';
 import { createTempDir, removeDir } from '../utils/runtime.js';
 
 function createIoCapture(): {
@@ -26,6 +29,17 @@ function createIoCapture(): {
     stdout,
     stderr,
   };
+}
+
+
+async function writeJson(filePath: string, value: unknown): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(filePath, JSON.stringify(value, null, 2), 'utf8');
+}
+
+async function writeText(filePath: string, value: string): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(filePath, value, 'utf8');
 }
 
 describe('reliability: team shutdown command', () => {
@@ -209,6 +223,104 @@ describe('reliability: team shutdown command', () => {
       expect(phase?.currentPhase).toBe('completed');
       expect(phase?.transitions).toHaveLength(0);
     } finally {
+      removeDir(tempRoot);
+    }
+  });
+
+
+  test('supports plugin backend identifier in persisted monitor snapshot', async () => {
+    const tempRoot = createTempDir('omg-team-shutdown-plugin-backend-');
+    const ioCapture = createIoCapture();
+    const previousEnable = process.env.OMG_PLUGINS;
+
+    try {
+      process.env.OMG_PLUGINS = '1';
+      const teamName = 'shutdown-plugin-backend-team';
+      const stateStore = new TeamStateStore({ cwd: tempRoot });
+      const now = new Date().toISOString();
+
+      await writeJson(path.join(tempRoot, 'package.json'), {
+        name: 'fixture-project',
+        version: '1.0.0',
+        dependencies: {
+          'oh-my-gemini-plugin-shutdown': '1.0.0',
+        },
+      });
+
+      await writeJson(path.join(tempRoot, 'node_modules', 'oh-my-gemini-plugin-shutdown', 'package.json'), {
+        name: 'oh-my-gemini-plugin-shutdown',
+        version: '1.0.0',
+        main: 'index.cjs',
+      });
+      await writeText(
+        path.join(tempRoot, 'node_modules', 'oh-my-gemini-plugin-shutdown', 'index.cjs'),
+        `module.exports = {
+  id: 'shutdown-plugin-runtime',
+  runtimeBackends: [
+    {
+      name: 'custom-plugin-runtime',
+      async probePrerequisites() {
+        return { ok: true, issues: [] };
+      },
+      async startTeam(input) {
+        return {
+          id: 'plugin-handle',
+          teamName: input.teamName,
+          backend: 'custom-plugin-runtime',
+          cwd: input.cwd,
+          startedAt: new Date(0).toISOString(),
+          runtime: {},
+        };
+      },
+      async monitorTeam(handle) {
+        return {
+          handleId: handle.id,
+          teamName: handle.teamName,
+          backend: 'custom-plugin-runtime',
+          status: 'running',
+          updatedAt: new Date(0).toISOString(),
+          workers: [],
+        };
+      },
+      async shutdownTeam() {},
+    },
+  ],
+};
+`,
+      );
+
+      await stateStore.writeMonitorSnapshot(teamName, {
+        runId: 'run-shutdown-plugin-backend-1',
+        teamName,
+        handleId: 'handle-shutdown-plugin-backend-1',
+        backend: 'custom-plugin-runtime',
+        status: 'running',
+        updatedAt: now,
+        workers: [],
+        runtime: {},
+      });
+
+      const result = await executeTeamShutdownCommand(
+        ['--team', teamName, '--force', '--json'],
+        {
+          cwd: tempRoot,
+          io: ioCapture.io,
+        },
+      );
+
+      expect(result.exitCode).toBe(0);
+      const output = JSON.parse(ioCapture.stdout.join('\n')) as {
+        details?: {
+          backend?: string;
+        };
+      };
+      expect(output.details?.backend).toBe('custom-plugin-runtime');
+    } finally {
+      if (previousEnable === undefined) {
+        delete process.env.OMG_PLUGINS;
+      } else {
+        process.env.OMG_PLUGINS = previousEnable;
+      }
       removeDir(tempRoot);
     }
   });
